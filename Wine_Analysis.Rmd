@@ -1,0 +1,312 @@
+---
+title: "Wine Quality Analysis"
+author: "Manfred Herdt"
+date: "12/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r Import the dataset}
+library(readr)
+library(tidyverse)
+library(tidymodels)
+library(cowplot)
+winequality_red <- read_csv("winequality-red.csv") 
+
+
+winequality_red <- winequality_red %>% mutate(perc_sulfur_dioxide = `free sulfur dioxide`/`total sulfur dioxide`) %>% select(-`free sulfur dioxide`, - `total sulfur dioxide`) %>% 
+  mutate(alcohol_level = case_when(alcohol < 7 ~ "< 7 %"
+                                   ,alcohol > 7 & alcohol <= 9 ~ "7 - 9 %"
+                                   ,alcohol > 9 & alcohol <= 11 ~ "9 - 11 %"
+                                   ,alcohol > 11 ~ "> 11 %")) %>% 
+  mutate(quality_level = case_when(quality == 3 | quality == 4 ~ "low_quality"
+                                   ,quality == 5 | quality == 6 ~ "medium_quality"
+                                   ,quality == 7 | quality == 8 ~ "high_quality")) %>% mutate(quality = as.factor(quality))
+```
+
+## EDA
+
+```{r}
+cormat <- winequality_red %>% select_if(is.numeric) %>% cor()
+cormat <- round(cormat ,2)
+library(reshape2)
+melted_cormat <- melt(cormat)
+
+
+ggplot(data = melted_cormat, aes(x=Var1, y=Var2, fill = value))+
+ geom_tile(color = "white")+
+geom_text(aes(Var2, Var1, label = value), color = "black", size = 4) 
+```
+
+```{r}
+library(plotly)
+winequality_red %>% filter(quality_level %in% c("high_quality", "low_quality")) %>% plot_ly(x = .$pH, y = .$alcohol, z = .$`residual sugar`, type="scatter3d", mode="markers", color = .$quality_level)
+```
+
+
+
+## PCA
+
+```{r}
+wine_pca <- winequality_red %>% select(where(is.numeric)) %>% # retain only numeric columns
+  prcomp(scale = TRUE) 
+```
+
+```{r}
+wine_pca %>%
+  augment(winequality_red) %>% # add original dataset back in
+  ggplot(aes(.fittedPC1, .fittedPC2, color = quality)) + 
+  geom_point(size = 1.5)
+```
+
+
+```{r}
+wine_pca %>%
+  tidy(matrix = "eigenvalues") %>%
+  ggplot(aes(PC, percent)) +
+  geom_col(fill = "#56B4E9", alpha = 0.8) +
+  scale_x_continuous(breaks = 1:9) +
+  scale_y_continuous(
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0.01))
+  )
+```
+
+
+```{r}
+# define arrow style for plotting
+arrow_style <- arrow(
+  angle = 20, ends = "first", type = "closed", length = grid::unit(8, "pt")
+)
+
+# plot rotation matrix
+wine_pca %>%
+  tidy(matrix = "rotation") %>%
+  pivot_wider(names_from = "PC", names_prefix = "PC", values_from = "value") %>%
+  ggplot(aes(PC1, PC2)) +
+  geom_segment(xend = 0, yend = 0, arrow = arrow_style) +
+  geom_text(
+    aes(label = column),
+    hjust = 1, nudge_x = -0.02, 
+    color = "#904C2F"
+  ) +
+  xlim(-1.25, .5) + ylim(-.5, 1) +
+  coord_fixed() + # fix aspect ratio to 1:1
+  theme_minimal_grid(12)
+```
+
+
+```{r k means}
+
+points <- winequality_red %>% select(where(is.numeric))
+
+kclusts <- 
+  tibble(k = 1:9) %>%
+  mutate(
+    kclust = map(k, ~kmeans(points, .x)),
+    tidied = map(kclust, tidy),
+    glanced = map(kclust, glance),
+    augmented = map(kclust, augment, points)
+  )
+
+```
+
+
+```{r}
+clusters <- 
+  kclusts %>%
+  unnest(cols = c(tidied))
+
+assignments <- 
+  kclusts %>% 
+  unnest(cols = c(augmented))
+
+clusterings <- 
+  kclusts %>%
+  unnest(cols = c(glanced))
+```
+
+```{r}
+p1 <- 
+  ggplot(assignments, aes(x = assignments$pH, y = assignments$chlorides)) +
+  geom_point(aes(color = .cluster), alpha = 0.8) + 
+  facet_wrap(~ k)
+p1
+```
+
+### Tidy way
+
+```{r}
+library(tidymodels)
+
+winequality_red_tidy <- winequality_red %>% select(where(is.numeric), quality)
+
+pca_wine <- recipe( quality ~., data = winequality_red_tidy) %>%
+  step_normalize(all_predictors()) %>%
+  step_pca(all_predictors())
+
+pca_prep <- prep(pca_wine)
+
+pca_prep
+```
+
+```{r}
+tidied_pca <- tidy(pca_prep, 2)
+
+tidied_pca %>%
+  filter(component %in% paste0("PC", 1:5)) %>%
+  mutate(component = fct_inorder(component)) %>%
+  ggplot(aes(value, terms, fill = terms)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~component, nrow = 1) +
+  labs(y = NULL)
+```
+
+```{r}
+library(tidytext)
+
+tidied_pca %>%
+  filter(component %in% paste0("PC", 1:4)) %>%
+  group_by(component) %>%
+  top_n(8, abs(value)) %>%
+  ungroup() %>%
+  mutate(terms = reorder_within(terms, abs(value), component)) %>%
+  ggplot(aes(abs(value), terms, fill = value > 0)) +
+  geom_col() +
+  facet_wrap(~component, scales = "free_y") +
+  scale_y_reordered() +
+  labs(
+    x = "Absolute value of contribution",
+    y = NULL, fill = "Positive?"
+  )
+```
+
+```{r}
+juice(pca_prep) %>%
+  ggplot(aes(PC1, PC2, label = quality)) +
+  geom_point(aes(color = quality), alpha = 0.7, size = 2) +
+  geom_text(check_overlap = TRUE, hjust = "inward") +
+  labs(color = NULL)
+```
+
+### umap
+
+```{r}
+library(embed)
+
+umap_rec <- recipe(quality ~., data = winequality_red_tidy) %>%
+  step_normalize(all_predictors()) %>%
+  step_umap(all_predictors())
+
+umap_prep <- prep(umap_rec)
+
+umap_prep
+```
+
+```{r}
+juice(umap_prep) %>%
+  ggplot(aes(umap_1, umap_2, label = quality)) +
+  geom_point(aes(color = quality), alpha = 0.7, size = 2) +
+  geom_text(check_overlap = TRUE, hjust = "inward") +
+  labs(color = NULL)
+```
+
+
+### autoencoders
+
+```{r}
+
+rw <- read_csv("winequality-red.csv") %>% mutate(quality = as.factor(quality))
+set.seed(1353)
+wine_split <- initial_split(rw)
+train_data <- training(wine_split)
+test_data <- testing(wine_split)
+```
+
+```{r}
+library(h2o)
+h2o.init()
+
+ae_model <- h2o.deeplearning(x = 1:11, training_frame = as.h2o(train_data),
+autoencoder = TRUE,
+reproducible = TRUE,
+ seed = 148,
+ hidden = c(10,10,10), epochs = 100,activation = "Tanh",
+validation_frame = as.h2o(test_data))
+```
+```{r}
+h2o.scoreHistory(ae_model)%>%head()
+```
+
+```{r}
+test_autoencoder <- h2o.predict(ae_model,  as.h2o(test_data))
+```
+
+```{r}
+train_features <- h2o.deepfeatures(ae_model, as.h2o(train_data), layer = 2) %>%
+  as.data.frame() %>%cbind(train_data %>% 
+  mutate(quality_level = case_when(quality == 3 | quality == 4 ~ "low_quality"
+                                   ,quality == 5 | quality == 6 ~ "medium_quality"
+                                   ,quality == 7 | quality == 8 ~ "high_quality")) %>% select(quality_level))
+```
+
+```{r}
+ggplot(train_features, aes(x = DF.L2.C1, y = DF.L2.C4, color = quality_level)) +
+  geom_point(alpha = 0.9,size=1.5)+theme_bw()
+```
+
+```{r}
+train_features %>% plot_ly(x = .$DF.L2.C1, y = .$DF.L2.C2, z = .$DF.L2.C3, type="scatter3d", mode="markers", color = .$quality_level)
+```
+
+
+## Anomaly detection
+
+```{r}
+anomaly <- h2o.anomaly(ae_model, as.h2o(test_data)) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column() %>%cbind(test_data %>% 
+  mutate(Class = case_when(quality == 3 | quality == 4 ~ "low_quality"
+                                   ,quality == 5 | quality == 6 ~ "medium_quality"
+                                   ,quality == 7 | quality == 8 ~ "high_quality")) %>% select(Class))
+mean_mse <- anomaly %>%
+  group_by(Class) %>%
+  summarise(mean = mean(Reconstruction.MSE))
+anomaly<-anomaly%>%mutate_if(is.character,as.factor)
+anomaly$rowname=as.numeric(anomaly$rowname)
+anomaly%>%head()
+```
+
+```{r}
+wine.anon = h2o.anomaly(ae_model, as.h2o(test_data), per_feature=FALSE)
+```
+
+```{r}
+MSE<-wine.anon%>%as_tibble()
+MSE$Index<-1:length(MSE$Reconstruction.MSE)
+ggplot(MSE,aes(x=Index,y=sort(Reconstruction.MSE)))+geom_point()+ylab("Reconstruction.MSE")
+```
+
+```{r}
+anomaly%>%ggplot( aes(x = rowname, y = Reconstruction.MSE,color=Class)) +
+  geom_point(alpha = 0.5) +
+  #geom_hline(data = mean_mse, aes(yintercept = mean)) +
+  geom_hline(yintercept =0.004,color="#3288BD") +
+  
+  labs(x = "instance number", color = "Class")
+```
+
+```{r}
+anomaly <- anomaly %>%
+  mutate(outlier = ifelse(Reconstruction.MSE > 0.004 , "outlier", "no_outlier"))
+anomaly %>%
+  group_by(Class, outlier) %>%
+ dplyr:: summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) 
+```
+
